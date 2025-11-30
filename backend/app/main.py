@@ -1,181 +1,184 @@
 import io
-import traceback
 import base64
+import traceback
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import shap
 import joblib
+import shap
+import matplotlib.pyplot as plt
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
-
-app = FastAPI(
-    title="ExplainMyModel Backend",
-    description="Upload a model + CSV → SHAP explanations + insights",
-    version="1.0.0",
-)
-
-MAX_UPLOAD_MB = 30 * 1024 * 1024  # 30MB
+app = FastAPI()
 
 
-# -----------------------------------------------------------
-# UTILITIES
-# -----------------------------------------------------------
+# ---------------------------------------------------
+# HEALTH CHECK (Render uses this for service uptime)
+# ---------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "message": "ExplainMyModel backend running. Use POST /explain"
+    }
 
-def read_csv(upload: UploadFile) -> pd.DataFrame:
-    content = upload.file.read()
-    if len(content) > MAX_UPLOAD_MB:
-        raise HTTPException(400, "CSV too large")
+
+# ---------------------------------------------------
+# HELPERS
+# ---------------------------------------------------
+
+def safe_read_csv(upload: UploadFile) -> pd.DataFrame:
     try:
+        data = upload.file.read()
         upload.file.seek(0)
-        df = pd.read_csv(upload.file)
-        if df.empty:
-            raise ValueError("CSV is empty")
-        return df
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read CSV: {e}")
+        return pd.read_csv(io.BytesIO(data))
+    except Exception:
+        raise HTTPException(400, "Invalid CSV file.")
 
 
-def load_model(upload: UploadFile):
-    content = upload.file.read()
-    if len(content) > MAX_UPLOAD_MB:
-        raise HTTPException(400, "Model file too large")
+def safe_load_model(upload: UploadFile):
+    try:
+        data = upload.file.read()
+        upload.file.seek(0)
+        model = joblib.load(io.BytesIO(data))
+    except Exception:
+        raise HTTPException(400, "Model file could not be loaded. Use joblib or pickle format.")
+
+    if not hasattr(model, "predict"):
+        raise HTTPException(400, "Uploaded file is not a valid ML model (missing predict()).")
+
+    return model
+
+
+def normalize_shap_values(values):
+    """
+    SHAP returns different structures:
+    - TreeClassifier: list of arrays (one per class)
+    - TreeRegressor: array
+    - KernelExplainer: array
+    - LinearExplainer: array
+
+    We convert everything into a clean 2D numpy array.
+    """
+    if isinstance(values, list):
+        # Classifier case → take mean magnitude across classes
+        arrs = [np.abs(v) for v in values]
+        merged = np.mean(arrs, axis=0)
+        return merged
+
+    values = np.array(values)
+
+    # If SHAP outputs (samples, features, classes) → reduce classes
+    if values.ndim == 3:
+        values = np.mean(values, axis=2)
+
+    return values
+
+
+def pick_explainer(model, X):
+    """
+    Smart explainer selection with fallback.
+    """
+    model_name = model.__class__.__name__.lower()
 
     try:
-        upload.file.seek(0)
-        model = joblib.load(upload.file)
-        if not hasattr(model, "predict"):
-            raise ValueError("File is not a valid ML model")
-        return model
-    except Exception as e:
-        raise HTTPException(400, f"Failed to load model: {e}")
+        if any(k in model_name for k in ["forest", "tree", "xgb", "lgb", "cat"]):
+            return shap.TreeExplainer(model)
+        if hasattr(model, "coef_"):  # Linear models
+            return shap.LinearExplainer(model, X)
+    except Exception:
+        pass
 
-
-def safe_sample(df: pd.DataFrame, max_rows: int = 200):
-    """Avoid SHAP failures by sampling oversized datasets."""
-    if len(df) > max_rows:
-        return df.sample(max_rows, random_state=42)
-    return df
-
-
-def choose_explainer(model, X_sample):
-    """Pick the best SHAP explainer for the model type."""
-    name = type(model).__name__.lower()
-
-    # Tree-based
-    if any(k in name for k in ["forest", "tree", "xgb", "xgboost", "lgbm", "catboost"]):
-        return shap.TreeExplainer(model)
-
-    # Linear models
-    if hasattr(model, "coef_"):
-        return shap.LinearExplainer(model, X_sample)
-
-    # Generic fallback
-    background = shap.sample(X_sample, min(50, len(X_sample)))
+    # Kernel fallback (slow → use sampling)
+    background = shap.sample(X, min(40, len(X)))
     return shap.KernelExplainer(model.predict, background)
 
 
-def compute_shap_values(model, X):
-    """Compute robust SHAP values without shape/index errors."""
-    X_sample = safe_sample(X)
-    explainer = choose_explainer(model, X_sample)
-
-    try:
-        shap_vals = explainer.shap_values(X_sample)
-
-        # SHAP sometimes returns list for multi-class → flatten to 2D
-        if isinstance(shap_vals, list):
-            shap_vals = np.array(shap_vals[0])
-
-        shap_vals = np.array(shap_vals)
-
-        # Force 2D shape consistency
-        if shap_vals.ndim == 1:
-            shap_vals = shap_vals.reshape(-1, 1)
-
-        if shap_vals.shape[1] != X_sample.shape[1]:
-            raise ValueError("SHAP value feature dimension mismatch.")
-
-        return shap_vals, X_sample
-    except Exception as e:
-        raise RuntimeError(f"SHAP computation failed: {e}\n{traceback.format_exc()}")
-
-
-def create_summary_plot(shap_vals, X_sample):
-    """Generate base64 SHAP summary plot."""
+def generate_summary_plot(shap_values, X_df):
     plt.switch_backend("Agg")
-    fig = plt.figure(figsize=(7, 4))
-    shap.summary_plot(shap_vals, X_sample, show=False)
 
+    fig = plt.figure(figsize=(8, 4))
+    shap.summary_plot(shap_values, X_df, show=False)
     buf = io.BytesIO()
     plt.tight_layout()
-    fig.savefig(buf, format="png")
-    buf.seek(0)
+    fig.savefig(buf, format="png", dpi=150)
     plt.close(fig)
+    buf.seek(0)
 
     return base64.b64encode(buf.read()).decode()
 
 
-def top_feature_explanations(shap_vals, X_sample, k=5):
-    avg_importance = np.mean(np.abs(shap_vals), axis=0)
-    idx = np.argsort(avg_importance)[::-1][:k]
+def build_natural_language_explanations(shap_values, X_df, top_k=5):
+    abs_vals = np.mean(np.abs(shap_values), axis=0)
+    top_idx = abs_vals.argsort()[::-1][:top_k]
 
     explanations = []
     suggestions = []
 
-    for i in idx:
-        feat = X_sample.columns[i]
-        score = float(avg_importance[i])
+    for idx in top_idx:
+        feature = X_df.columns[idx]
+        score = float(abs_vals[idx])
 
         explanations.append({
-            "feature": feat,
+            "feature": feature,
             "importance": score,
-            "explanation": f"'{feat}' has a strong influence on predictions. Larger changes in this feature tend to shift the model’s output noticeably."
+            "explanation": f"'{feature}' strongly influences the model. Higher variation in this feature leads to noticeable prediction changes."
         })
 
         suggestions.append(
-            f"Consider improving data quality or engineering '{feat}' further — it's one of the top drivers affecting prediction stability."
+            f"Consider improving feature quality or adding more samples for '{feature}' to improve the model’s stability."
         )
 
     return explanations, suggestions
 
 
-# -----------------------------------------------------------
-# ROOT HEALTH CHECK (Render expects something on "/")
-# -----------------------------------------------------------
-@app.get("/")
-def health():
-    return {"status": "ok", "message": "ExplainMyModel backend running. POST to /explain"}
-
-
-# -----------------------------------------------------------
-# EXPLAIN ENDPOINT
-# -----------------------------------------------------------
-
+# ---------------------------------------------------
+# MAIN EXPLAIN ENDPOINT
+# ---------------------------------------------------
 @app.post("/explain")
 async def explain(model_file: UploadFile = File(...), csv_file: UploadFile = File(...)):
     try:
-        X = read_csv(csv_file)
-        model = load_model(model_file)
+        X = safe_read_csv(csv_file)
+        model = safe_load_model(model_file)
 
-        shap_vals, X_sample = compute_shap_values(model, X)
+        # Auto-sample to avoid large SHAP computations
+        if len(X) > 300:
+            X_small = X.sample(300, random_state=42)
+        else:
+            X_small = X
 
-        summary_plot_b64 = create_summary_plot(shap_vals, X_sample)
-        explanations, suggestions = top_feature_explanations(shap_vals, X_sample)
+        explainer = pick_explainer(model, X_small)
+
+        # Compute SHAP values
+        shap_values_raw = explainer.shap_values(X_small)
+        shap_values = normalize_shap_values(shap_values_raw)
+
+        # Ensure shapes match
+        if shap_values.shape[1] != X_small.shape[1]:
+            raise RuntimeError("SHAP mismatch: feature count does not match CSV columns.")
+
+        # Generate plot
+        plot_b64 = generate_summary_plot(shap_values, X_small)
+
+        # Natural language
+        feature_exp, suggestions = build_natural_language_explanations(shap_values, X_small)
 
         return JSONResponse({
-            "summary_plot_b64": summary_plot_b64,
-            "feature_explanations": explanations,
+            "explainer": explainer.__class__.__name__,
+            "summary_plot_b64": plot_b64,
+            "feature_explanations": feature_exp,
             "suggestions": suggestions
         })
 
-    except HTTPException as he:
-        raise he
+    except HTTPException as e:
+        raise e
 
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"detail": f"Unexpected error: {e}"}
+            content={
+                "detail": f"Unexpected error: {e}",
+                "trace": traceback.format_exc()
+            }
         )
