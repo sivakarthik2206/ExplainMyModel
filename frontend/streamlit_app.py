@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 
 # Configuration
-API_URL = "http://localhost:8000/explain"
+API_URL = os.environ.get('API_URL','http://localhost:8000/explain')
 REQUEST_TIMEOUT = 120
 
 st.set_page_config(page_title="ExplainMyModel", layout="centered")
