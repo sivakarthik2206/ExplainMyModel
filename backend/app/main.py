@@ -24,6 +24,17 @@ app = FastAPI(title="ExplainMyModel")
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "ExplainMyModel backend. POST /explain"}
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Allow calls from anywhere for demo (restrict in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Allow the frontend (Streamlit) to call this API during demos or hosted deployment.
