@@ -21,6 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="ExplainMyModel")
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "ExplainMyModel backend. POST /explain"}
+
 
 # Allow the frontend (Streamlit) to call this API during demos or hosted deployment.
 app.add_middleware(
